@@ -143,6 +143,7 @@ request_type_t request_paths[] = {
     {REQ_GET, "/api/toniesJsonReload", SERTY_WEB, &handleApiToniesJsonReload},
     {REQ_GET, "/api/toniesJson", SERTY_WEB, &handleApiToniesJson},
     {REQ_GET, "/api/toniesCustomJson", SERTY_WEB, &handleApiToniesCustomJson},
+    {REQ_POST, "/api/toniesCustomJsonSet", SERTY_WEB, &handleApiToniesCustomJsonSet},
     {REQ_GET, "/api/tonieboxesJson", SERTY_WEB, &handleApiTonieboxJson},
     {REQ_GET, "/api/tonieboxesCustomJson", SERTY_WEB, &handleApiTonieboxCustomJson},
     {REQ_GET, "/api/trigger", SERTY_WEB, &handleApiTrigger},
