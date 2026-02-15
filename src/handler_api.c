@@ -135,6 +135,30 @@ error_t queryPrepare(const char *queryString, const char **rootPath, char *overl
                 return ERROR_FAILURE;
             }
         }
+        else if (!osStrcmp(special, "custom_img"))
+        {
+            const char *wwwDir = settings_get_string_ovl("internal.wwwdirfull", overlay);
+            if (wwwDir == NULL || osStrlen(wwwDir) == 0)
+            {
+                TRACE_ERROR("internal.wwwdirfull not set to a valid path: '%s'\r\n", wwwDir);
+                return ERROR_FAILURE;
+            }
+
+            static char customImgDir[1024];
+            osSnprintf(customImgDir, sizeof(customImgDir), "%s%c%s", wwwDir, PATH_SEPARATOR, "custom_img");
+
+            if (!fsDirExists(customImgDir))
+            {
+                error_t createErr = fsCreateDirEx(customImgDir, true);
+                if (createErr != NO_ERROR || !fsDirExists(customImgDir))
+                {
+                    TRACE_ERROR("custom_img dir '%s' does not exist and could not be created. Error: %s\r\n", customImgDir, error2text(createErr));
+                    return ERROR_FAILURE;
+                }
+            }
+
+            *rootPath = customImgDir;
+        }
     }
 
     return NO_ERROR;
@@ -2532,6 +2556,96 @@ static bool jsonGetUInt32Flexible(cJSON *value, uint32_t *out)
     return false;
 }
 
+static bool jsonGetInt32Flexible(cJSON *value, int32_t *out)
+{
+    if (cJSON_IsNumber(value))
+    {
+        *out = (int32_t)value->valuedouble;
+        return true;
+    }
+
+    if (cJSON_IsString(value) && value->valuestring != NULL && osStrlen(value->valuestring) > 0)
+    {
+        char *endptr = NULL;
+        long parsed = strtol(value->valuestring, &endptr, 10);
+        if (endptr == NULL || *endptr != '\0')
+        {
+            return false;
+        }
+        *out = (int32_t)parsed;
+        return true;
+    }
+
+    return false;
+}
+
+static error_t loadJsonFromFile(const char *path, cJSON **outRoot)
+{
+    *outRoot = NULL;
+
+    uint32_t fileSize32 = 0;
+    error_t sizeErr = fsGetFileSize(path, &fileSize32);
+    if (sizeErr != NO_ERROR)
+    {
+        return sizeErr;
+    }
+    size_t fileSize = (size_t)fileSize32;
+
+    FsFile *file = fsOpenFile(path, FS_FILE_MODE_READ);
+    if (file == NULL)
+    {
+        return ERROR_FILE_NOT_FOUND;
+    }
+
+    char *buffer = osAllocMem(fileSize + 1);
+    if (buffer == NULL)
+    {
+        fsCloseFile(file);
+        return ERROR_OUT_OF_MEMORY;
+    }
+    osMemset(buffer, 0, fileSize + 1);
+
+    size_t pos = 0;
+    while (pos < fileSize)
+    {
+        size_t readSize = 0;
+        error_t readErr = fsReadFile(file, &buffer[pos], fileSize - pos, &readSize);
+        if (readErr != NO_ERROR)
+        {
+            fsCloseFile(file);
+            osFreeMem(buffer);
+            return readErr;
+        }
+        if (readSize == 0)
+        {
+            break;
+        }
+        pos += readSize;
+    }
+    fsCloseFile(file);
+
+    cJSON *root = cJSON_ParseWithLengthOpts(buffer, pos, 0, 0);
+    osFreeMem(buffer);
+    if (root == NULL)
+    {
+        return ERROR_INVALID_SYNTAX;
+    }
+
+    *outRoot = root;
+    return NO_ERROR;
+}
+
+static bool queryParamIsTrue(const char *queryString, const char *key)
+{
+    char value[16];
+    osMemset(value, 0, sizeof(value));
+    if (!queryGet(queryString, key, value, sizeof(value)))
+    {
+        return false;
+    }
+    return osStrcasecmp(value, "1") == 0 || osStrcasecmp(value, "true") == 0 || osStrcasecmp(value, "yes") == 0;
+}
+
 static error_t validateToniesCustomJson(cJSON *root, char *message, size_t messageSize)
 {
     if (!cJSON_IsArray(root))
@@ -2563,8 +2677,81 @@ static error_t validateToniesCustomJson(cJSON *root, char *message, size_t messa
             return ERROR_INVALID_SYNTAX;
         }
 
+        cJSON *noValue = cJSON_GetObjectItemCaseSensitive(entry, "no");
+        cJSON *title = cJSON_GetObjectItemCaseSensitive(entry, "title");
+        cJSON *episodes = cJSON_GetObjectItemCaseSensitive(entry, "episodes");
+        cJSON *release = cJSON_GetObjectItemCaseSensitive(entry, "release");
+        cJSON *language = cJSON_GetObjectItemCaseSensitive(entry, "language");
+        cJSON *category = cJSON_GetObjectItemCaseSensitive(entry, "category");
+        cJSON *pic = cJSON_GetObjectItemCaseSensitive(entry, "pic");
+        cJSON *tracks = cJSON_GetObjectItemCaseSensitive(entry, "tracks");
+
+        if (noValue != NULL && !cJSON_IsString(noValue))
+        {
+            osSnprintf(message, messageSize, "Invalid entry at index %" PRIuSIZE ": 'no' must be string", i);
+            return ERROR_INVALID_SYNTAX;
+        }
+        if (title != NULL && !cJSON_IsString(title))
+        {
+            osSnprintf(message, messageSize, "Invalid entry at index %" PRIuSIZE ": 'title' must be string", i);
+            return ERROR_INVALID_SYNTAX;
+        }
+        if (episodes != NULL && !cJSON_IsString(episodes))
+        {
+            osSnprintf(message, messageSize, "Invalid entry at index %" PRIuSIZE ": 'episodes' must be string", i);
+            return ERROR_INVALID_SYNTAX;
+        }
+        if (language != NULL && !cJSON_IsString(language))
+        {
+            osSnprintf(message, messageSize, "Invalid entry at index %" PRIuSIZE ": 'language' must be string", i);
+            return ERROR_INVALID_SYNTAX;
+        }
+        if (category != NULL && !cJSON_IsString(category))
+        {
+            osSnprintf(message, messageSize, "Invalid entry at index %" PRIuSIZE ": 'category' must be string", i);
+            return ERROR_INVALID_SYNTAX;
+        }
+        if (pic != NULL && !cJSON_IsString(pic))
+        {
+            osSnprintf(message, messageSize, "Invalid entry at index %" PRIuSIZE ": 'pic' must be string", i);
+            return ERROR_INVALID_SYNTAX;
+        }
+        if (release != NULL)
+        {
+            int32_t parsedRelease = 0;
+            if (!jsonGetInt32Flexible(release, &parsedRelease))
+            {
+                osSnprintf(message, messageSize, "Invalid entry at index %" PRIuSIZE ": 'release' must be numeric", i);
+                return ERROR_INVALID_SYNTAX;
+            }
+            (void)parsedRelease;
+        }
+        if (tracks != NULL)
+        {
+            if (!cJSON_IsArray(tracks))
+            {
+                osSnprintf(message, messageSize, "Invalid entry at index %" PRIuSIZE ": 'tracks' must be array", i);
+                return ERROR_INVALID_SYNTAX;
+            }
+            size_t trackCount = (size_t)cJSON_GetArraySize(tracks);
+            for (size_t ti = 0; ti < trackCount; ti++)
+            {
+                cJSON *track = cJSON_GetArrayItem(tracks, (int)ti);
+                if (!cJSON_IsString(track))
+                {
+                    osSnprintf(message, messageSize, "Invalid entry at index %" PRIuSIZE ": 'tracks[%zu]' must be string", i, ti);
+                    return ERROR_INVALID_SYNTAX;
+                }
+            }
+        }
+
         cJSON *audioId = cJSON_GetObjectItemCaseSensitive(entry, "audio_id");
         cJSON *hash = cJSON_GetObjectItemCaseSensitive(entry, "hash");
+        if ((audioId != NULL && !cJSON_IsArray(audioId)) || (hash != NULL && !cJSON_IsArray(hash)))
+        {
+            osSnprintf(message, messageSize, "Invalid entry at index %" PRIuSIZE ": 'audio_id' and 'hash' must be arrays", i);
+            return ERROR_INVALID_SYNTAX;
+        }
         size_t audioCount = cJSON_IsArray(audioId) ? (size_t)cJSON_GetArraySize(audioId) : 0;
         size_t hashCount = cJSON_IsArray(hash) ? (size_t)cJSON_GetArraySize(hash) : 0;
 
@@ -2652,6 +2839,101 @@ static error_t validateToniesCustomJson(cJSON *root, char *message, size_t messa
     return NO_ERROR;
 }
 
+static error_t detectToniesBaseOverride(cJSON *customRoot, char *message, size_t messageSize)
+{
+    const char *configDir = settings_get_string("internal.configdirfull");
+    char *basePath = custom_asprintf("%s%c%s", configDir, PATH_SEPARATOR, TONIES_JSON_FILE);
+    if (basePath == NULL)
+    {
+        osSnprintf(message, messageSize, "Could not allocate base path");
+        return ERROR_OUT_OF_MEMORY;
+    }
+
+    if (!fsFileExists(basePath))
+    {
+        osFreeMem(basePath);
+        osSnprintf(message, messageSize, "OK");
+        return NO_ERROR;
+    }
+
+    cJSON *baseRoot = NULL;
+    error_t loadErr = loadJsonFromFile(basePath, &baseRoot);
+    osFreeMem(basePath);
+    if (loadErr != NO_ERROR)
+    {
+        osSnprintf(message, messageSize, "Could not parse base tonies.json");
+        return ERROR_INVALID_SYNTAX;
+    }
+
+    if (!cJSON_IsArray(baseRoot))
+    {
+        cJSON_Delete(baseRoot);
+        osSnprintf(message, messageSize, "Base tonies.json has invalid format");
+        return ERROR_INVALID_SYNTAX;
+    }
+
+    size_t customCount = (size_t)cJSON_GetArraySize(customRoot);
+    size_t baseCount = (size_t)cJSON_GetArraySize(baseRoot);
+    for (size_t i = 0; i < customCount; i++)
+    {
+        cJSON *customEntry = cJSON_GetArrayItem(customRoot, (int)i);
+        cJSON *customModel = cJSON_GetObjectItemCaseSensitive(customEntry, "model");
+        cJSON *customAudio = cJSON_GetObjectItemCaseSensitive(customEntry, "audio_id");
+        cJSON *customHash = cJSON_GetObjectItemCaseSensitive(customEntry, "hash");
+        size_t customAudioCount = cJSON_IsArray(customAudio) ? (size_t)cJSON_GetArraySize(customAudio) : 0;
+
+        for (size_t j = 0; j < baseCount; j++)
+        {
+            cJSON *baseEntry = cJSON_GetArrayItem(baseRoot, (int)j);
+            cJSON *baseModel = cJSON_GetObjectItemCaseSensitive(baseEntry, "model");
+
+            if (cJSON_IsString(customModel) && cJSON_IsString(baseModel) && osStrcasecmp(customModel->valuestring, baseModel->valuestring) == 0)
+            {
+                osSnprintf(message, messageSize, "BASE_OVERRIDE_WARNING: model '%s' already exists in base tonies.json. Retry with allowBaseOverride=true to confirm overwrite behavior.", customModel->valuestring);
+                cJSON_Delete(baseRoot);
+                return ERROR_ALREADY_EXISTS;
+            }
+
+            cJSON *baseAudio = cJSON_GetObjectItemCaseSensitive(baseEntry, "audio_id");
+            cJSON *baseHash = cJSON_GetObjectItemCaseSensitive(baseEntry, "hash");
+            size_t baseAudioCount = cJSON_IsArray(baseAudio) ? (size_t)cJSON_GetArraySize(baseAudio) : 0;
+
+            for (size_t ci = 0; ci < customAudioCount; ci++)
+            {
+                cJSON *customAudioValue = cJSON_GetArrayItem(customAudio, (int)ci);
+                cJSON *customHashValue = cJSON_GetArrayItem(customHash, (int)ci);
+                uint32_t customAudioId = 0;
+                if (!jsonGetUInt32Flexible(customAudioValue, &customAudioId) || !cJSON_IsString(customHashValue))
+                {
+                    continue;
+                }
+
+                for (size_t bi = 0; bi < baseAudioCount; bi++)
+                {
+                    cJSON *baseAudioValue = cJSON_GetArrayItem(baseAudio, (int)bi);
+                    cJSON *baseHashValue = cJSON_GetArrayItem(baseHash, (int)bi);
+                    uint32_t baseAudioId = 0;
+                    if (!jsonGetUInt32Flexible(baseAudioValue, &baseAudioId) || !cJSON_IsString(baseHashValue))
+                    {
+                        continue;
+                    }
+
+                    if (customAudioId == baseAudioId && osStrcasecmp(customHashValue->valuestring, baseHashValue->valuestring) == 0)
+                    {
+                        osSnprintf(message, messageSize, "BASE_OVERRIDE_WARNING: audio_id+hash pair already exists in base tonies.json (audio_id=%" PRIu32 "). Retry with allowBaseOverride=true to confirm overwrite behavior.", customAudioId);
+                        cJSON_Delete(baseRoot);
+                        return ERROR_ALREADY_EXISTS;
+                    }
+                }
+            }
+        }
+    }
+
+    cJSON_Delete(baseRoot);
+    osSnprintf(message, messageSize, "OK");
+    return NO_ERROR;
+}
+
 static int cmpStringAsc(const void *a, const void *b)
 {
     const char *s1 = *(const char *const *)a;
@@ -2730,7 +3012,7 @@ static void cleanupToniesCustomJsonBackups(const char *configDir, const char *ba
 error_t handleApiToniesCustomJsonSet(HttpConnection *connection, const char_t *uri, const char_t *queryString, client_ctx_t *client_ctx)
 {
     (void)uri;
-    (void)queryString;
+    (void)client_ctx;
 
     if (connection->request.byteCount == 0 || connection->request.byteCount > (1024 * 1024))
     {
@@ -2769,6 +3051,24 @@ error_t handleApiToniesCustomJsonSet(HttpConnection *connection, const char_t *u
         return writeApiStatusText(connection, 400, validationMessage);
     }
 
+    if (!queryParamIsTrue(queryString, "allowBaseOverride"))
+    {
+        char baseOverrideMessage[320];
+        error_t baseOverrideErr = detectToniesBaseOverride(inputJson, baseOverrideMessage, sizeof(baseOverrideMessage));
+        if (baseOverrideErr == ERROR_ALREADY_EXISTS)
+        {
+            cJSON_Delete(inputJson);
+            osFreeMem(postData);
+            return writeApiStatusText(connection, 409, baseOverrideMessage);
+        }
+        if (baseOverrideErr != NO_ERROR)
+        {
+            cJSON_Delete(inputJson);
+            osFreeMem(postData);
+            return writeApiStatusText(connection, 400, baseOverrideMessage);
+        }
+    }
+
     char *jsonString = cJSON_PrintUnformatted(inputJson);
     cJSON_Delete(inputJson);
     osFreeMem(postData);
@@ -2796,8 +3096,15 @@ error_t handleApiToniesCustomJsonSet(HttpConnection *connection, const char_t *u
         }
 
         char *backupPath = custom_asprintf("%s%c%s.%s.bak", configDir, PATH_SEPARATOR, TONIES_CUSTOM_JSON_FILE, timestamp);
-        fsCopyFile(targetPath, backupPath, true);
+        error_t backupErr = fsCopyFile(targetPath, backupPath, true);
         osFreeMem(backupPath);
+        if (backupErr != NO_ERROR)
+        {
+            osFreeMem(jsonString);
+            osFreeMem(tmpPath);
+            osFreeMem(targetPath);
+            return writeApiStatusText(connection, 500, "Failed to create backup of tonies.custom.json");
+        }
     }
 
     cleanupToniesCustomJsonBackups(configDir, TONIES_CUSTOM_JSON_FILE, 10);
