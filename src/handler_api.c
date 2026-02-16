@@ -2507,6 +2507,7 @@ static bool isHexHashString(const char *buf)
 
 static bool jsonGetUInt32Flexible(cJSON *value, uint32_t *out)
 {
+    // Accept numeric JSON values and numeric strings to tolerate mixed client payloads.
     if (cJSON_IsNumber(value))
     {
         if (value->valuedouble < 0)
@@ -2532,6 +2533,134 @@ static bool jsonGetUInt32Flexible(cJSON *value, uint32_t *out)
     return false;
 }
 
+static bool isTrueFlagValue(const char *value)
+{
+    if (value == NULL)
+    {
+        return false;
+    }
+
+    return (osStrcasecmp(value, "1") == 0 ||
+            osStrcasecmp(value, "true") == 0 ||
+            osStrcasecmp(value, "yes") == 0 ||
+            osStrcasecmp(value, "on") == 0);
+}
+
+static void freeStringKeyArray(char **keys, size_t keyCount)
+{
+    if (keys == NULL)
+    {
+        return;
+    }
+
+    for (size_t i = 0; i < keyCount; i++)
+    {
+        if (keys[i] != NULL)
+        {
+            osFreeMem(keys[i]);
+        }
+    }
+    osFreeMem(keys);
+}
+
+typedef struct
+{
+    char *key;
+    size_t index;
+} string_key_index_t;
+
+static void freeStringKeyIndexArray(string_key_index_t *keys, size_t keyCount)
+{
+    if (keys == NULL)
+    {
+        return;
+    }
+
+    for (size_t i = 0; i < keyCount; i++)
+    {
+        if (keys[i].key != NULL)
+        {
+            osFreeMem(keys[i].key);
+        }
+    }
+    osFreeMem(keys);
+}
+
+static int compareStringKeysCaseInsensitive(const void *a, const void *b)
+{
+    const char *left = *((const char *const *)a);
+    const char *right = *((const char *const *)b);
+    return osStrcasecmp(left, right);
+}
+
+static int compareStringKeyIndex(const void *a, const void *b)
+{
+    const string_key_index_t *left = (const string_key_index_t *)a;
+    const string_key_index_t *right = (const string_key_index_t *)b;
+    return osStrcmp(left->key, right->key);
+}
+
+static int compareStringKeyIndexCaseInsensitive(const void *a, const void *b)
+{
+    const string_key_index_t *left = (const string_key_index_t *)a;
+    const string_key_index_t *right = (const string_key_index_t *)b;
+    return osStrcasecmp(left->key, right->key);
+}
+
+static bool sortedStringArrayContainsCaseInsensitive(char **sortedKeys, size_t keyCount, const char *needle)
+{
+    if (sortedKeys == NULL || needle == NULL || keyCount == 0)
+    {
+        return false;
+    }
+
+    size_t left = 0;
+    size_t right = keyCount;
+    while (left < right)
+    {
+        size_t middle = left + (right - left) / 2;
+        int cmp = osStrcasecmp(sortedKeys[middle], needle);
+        if (cmp == 0)
+        {
+            return true;
+        }
+        if (cmp < 0)
+        {
+            left = middle + 1;
+        }
+        else
+        {
+            right = middle;
+        }
+    }
+
+    return false;
+}
+
+static error_t buildAudioHashKey(uint32_t audioId, const char *hashValue, char **outKey)
+{
+    if (outKey == NULL || hashValue == NULL)
+    {
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    char normalizedHash[41];
+    for (size_t i = 0; i < 40; i++)
+    {
+        normalizedHash[i] = osToupper(hashValue[i]);
+    }
+    normalizedHash[40] = '\0';
+
+    char *key = custom_asprintf("%" PRIu32 "|%s", audioId, normalizedHash);
+    if (key == NULL)
+    {
+        return ERROR_OUT_OF_MEMORY;
+    }
+
+    *outKey = key;
+    return NO_ERROR;
+}
+
 static error_t validateToniesCustomJson(cJSON *root, char *message, size_t messageSize)
 {
     if (!cJSON_IsArray(root))
@@ -2541,6 +2670,7 @@ static error_t validateToniesCustomJson(cJSON *root, char *message, size_t messa
     }
 
     size_t entryCount = (size_t)cJSON_GetArraySize(root);
+    size_t pairCount = 0;
     for (size_t i = 0; i < entryCount; i++)
     {
         cJSON *entry = cJSON_GetArrayItem(root, (int)i);
@@ -2593,56 +2723,507 @@ static error_t validateToniesCustomJson(cJSON *root, char *message, size_t messa
             }
             (void)parsedAudioId;
         }
+
+        pairCount += audioCount;
     }
 
-    // Duplicate checks: model and audio_id+hash pairs must be unique inside custom json.
+    string_key_index_t *modelKeys = NULL;
+    string_key_index_t *pairKeys = NULL;
+    size_t modelKeyCount = 0;
+    size_t pairKeyCount = 0;
+    error_t result = NO_ERROR;
+
+    if (entryCount > 0)
+    {
+        modelKeys = osAllocMem(sizeof(string_key_index_t) * entryCount);
+        if (modelKeys == NULL)
+        {
+            osSnprintf(message, messageSize, "Out of memory");
+            return ERROR_OUT_OF_MEMORY;
+        }
+        osMemset(modelKeys, 0, sizeof(string_key_index_t) * entryCount);
+    }
+
+    if (pairCount > 0)
+    {
+        pairKeys = osAllocMem(sizeof(string_key_index_t) * pairCount);
+        if (pairKeys == NULL)
+        {
+            freeStringKeyIndexArray(modelKeys, modelKeyCount);
+            osSnprintf(message, messageSize, "Out of memory");
+            return ERROR_OUT_OF_MEMORY;
+        }
+        osMemset(pairKeys, 0, sizeof(string_key_index_t) * pairCount);
+    }
+
     for (size_t i = 0; i < entryCount; i++)
     {
-        cJSON *entryA = cJSON_GetArrayItem(root, (int)i);
-        cJSON *modelA = cJSON_GetObjectItemCaseSensitive(entryA, "model");
-        cJSON *audioIdA = cJSON_GetObjectItemCaseSensitive(entryA, "audio_id");
-        cJSON *hashA = cJSON_GetObjectItemCaseSensitive(entryA, "hash");
-        size_t audioCountA = cJSON_IsArray(audioIdA) ? (size_t)cJSON_GetArraySize(audioIdA) : 0;
-
-        for (size_t k = i + 1; k < entryCount; k++)
+        cJSON *entry = cJSON_GetArrayItem(root, (int)i);
+        cJSON *model = cJSON_GetObjectItemCaseSensitive(entry, "model");
+        modelKeys[modelKeyCount].key = custom_asprintf("%s", model->valuestring);
+        modelKeys[modelKeyCount].index = i;
+        if (modelKeys[modelKeyCount].key == NULL)
         {
-            cJSON *entryB = cJSON_GetArrayItem(root, (int)k);
-            cJSON *modelB = cJSON_GetObjectItemCaseSensitive(entryB, "model");
-            if (cJSON_IsString(modelA) && cJSON_IsString(modelB) && osStrcasecmp(modelA->valuestring, modelB->valuestring) == 0)
+            result = ERROR_OUT_OF_MEMORY;
+            osSnprintf(message, messageSize, "Out of memory");
+            goto cleanup;
+        }
+        modelKeyCount++;
+
+        cJSON *audioId = cJSON_GetObjectItemCaseSensitive(entry, "audio_id");
+        cJSON *hash = cJSON_GetObjectItemCaseSensitive(entry, "hash");
+        size_t audioCount = cJSON_IsArray(audioId) ? (size_t)cJSON_GetArraySize(audioId) : 0;
+        for (size_t j = 0; j < audioCount; j++)
+        {
+            cJSON *audioIdValue = cJSON_GetArrayItem(audioId, (int)j);
+            cJSON *hashValue = cJSON_GetArrayItem(hash, (int)j);
+            uint32_t parsedAudioId = 0;
+
+            if (!jsonGetUInt32Flexible(audioIdValue, &parsedAudioId) || !cJSON_IsString(hashValue))
             {
-                osSnprintf(message, messageSize, "Duplicate custom model '%s' at indexes %" PRIuSIZE " and %" PRIuSIZE, modelA->valuestring, i, k);
+                result = ERROR_INVALID_SYNTAX;
+                osSnprintf(message, messageSize, "Invalid entry at index %" PRIuSIZE, i);
+                goto cleanup;
+            }
+
+            error_t keyError = buildAudioHashKey(parsedAudioId, hashValue->valuestring, &pairKeys[pairKeyCount].key);
+            if (keyError != NO_ERROR)
+            {
+                result = keyError;
+                osSnprintf(message, messageSize, "Out of memory");
+                goto cleanup;
+            }
+            pairKeys[pairKeyCount].index = i;
+            pairKeyCount++;
+        }
+    }
+
+    if (modelKeyCount > 1)
+    {
+        qsort(modelKeys, modelKeyCount, sizeof(string_key_index_t), compareStringKeyIndexCaseInsensitive);
+        for (size_t i = 1; i < modelKeyCount; i++)
+        {
+            if (osStrcasecmp(modelKeys[i - 1].key, modelKeys[i].key) == 0)
+            {
+                result = ERROR_INVALID_SYNTAX;
+                osSnprintf(message, messageSize, "Duplicate custom model '%s' at indexes %" PRIuSIZE " and %" PRIuSIZE, modelKeys[i].key, modelKeys[i - 1].index, modelKeys[i].index);
+                goto cleanup;
+            }
+        }
+    }
+
+    if (pairKeyCount > 1)
+    {
+        qsort(pairKeys, pairKeyCount, sizeof(string_key_index_t), compareStringKeyIndex);
+        for (size_t i = 1; i < pairKeyCount; i++)
+        {
+            if (osStrcmp(pairKeys[i - 1].key, pairKeys[i].key) == 0)
+            {
+                const char *separator = osStrchr(pairKeys[i].key, '|');
+                const char *audioIdString = pairKeys[i].key;
+                char audioIdBuffer[32];
+                if (separator != NULL)
+                {
+                    size_t copyLen = (size_t)(separator - pairKeys[i].key);
+                    if (copyLen >= sizeof(audioIdBuffer))
+                    {
+                        copyLen = sizeof(audioIdBuffer) - 1;
+                    }
+                    osMemcpy(audioIdBuffer, pairKeys[i].key, copyLen);
+                    audioIdBuffer[copyLen] = '\0';
+                    audioIdString = audioIdBuffer;
+                }
+                result = ERROR_INVALID_SYNTAX;
+                osSnprintf(message, messageSize, "Duplicate audio_id+hash pair detected (audio_id=%s) at indexes %" PRIuSIZE " and %" PRIuSIZE, audioIdString, pairKeys[i - 1].index, pairKeys[i].index);
+                goto cleanup;
+            }
+        }
+    }
+
+    result = NO_ERROR;
+    osSnprintf(message, messageSize, "OK");
+cleanup:
+    freeStringKeyIndexArray(pairKeys, pairKeyCount);
+    freeStringKeyIndexArray(modelKeys, modelKeyCount);
+    return result;
+}
+
+static error_t ensureNoExistingModelRemovedWithoutFlag(cJSON *newRoot, const char *configDir, bool allowRemoval, char *message, size_t messageSize)
+{
+    if (allowRemoval)
+    {
+        osSnprintf(message, messageSize, "OK");
+        return NO_ERROR;
+    }
+
+    char *targetPath = custom_asprintf("%s%c%s", configDir, PATH_SEPARATOR, TONIES_CUSTOM_JSON_FILE);
+    if (targetPath == NULL)
+    {
+        osSnprintf(message, messageSize, "Out of memory");
+        return ERROR_OUT_OF_MEMORY;
+    }
+
+    if (!fsFileExists(targetPath))
+    {
+        osFreeMem(targetPath);
+        osSnprintf(message, messageSize, "OK");
+        return NO_ERROR;
+    }
+
+    size_t fileSize = 0;
+    if (fsGetFileSize(targetPath, (uint32_t *)&fileSize) != NO_ERROR)
+    {
+        osFreeMem(targetPath);
+        osSnprintf(message, messageSize, "Failed to inspect existing tonies.custom.json");
+        return ERROR_FAILURE;
+    }
+
+    char *rawJson = osAllocMem(fileSize + 1);
+    if (rawJson == NULL)
+    {
+        osFreeMem(targetPath);
+        osSnprintf(message, messageSize, "Out of memory");
+        return ERROR_OUT_OF_MEMORY;
+    }
+    osMemset(rawJson, 0, fileSize + 1);
+
+    FsFile *file = fsOpenFile(targetPath, FS_FILE_MODE_READ);
+    if (file == NULL)
+    {
+        osFreeMem(rawJson);
+        osFreeMem(targetPath);
+        osSnprintf(message, messageSize, "Failed to open existing tonies.custom.json");
+        return ERROR_FILE_OPENING_FAILED;
+    }
+
+    size_t pos = 0;
+    while (pos < fileSize)
+    {
+        size_t sizeRead = 0;
+        error_t readError = fsReadFile(file, &rawJson[pos], fileSize - pos, &sizeRead);
+        if (readError != NO_ERROR)
+        {
+            fsCloseFile(file);
+            osFreeMem(rawJson);
+            osFreeMem(targetPath);
+            osSnprintf(message, messageSize, "Failed to read existing tonies.custom.json");
+            return readError;
+        }
+        if (sizeRead == 0)
+        {
+            break;
+        }
+        pos += sizeRead;
+    }
+    fsCloseFile(file);
+    osFreeMem(targetPath);
+
+    cJSON *existingRoot = cJSON_ParseWithLengthOpts(rawJson, pos, 0, 0);
+    osFreeMem(rawJson);
+    if (!cJSON_IsArray(existingRoot))
+    {
+        cJSON_Delete(existingRoot);
+        osSnprintf(message, messageSize, "Failed to parse existing tonies.custom.json");
+        return ERROR_INVALID_SYNTAX;
+    }
+
+    size_t newCount = (size_t)cJSON_GetArraySize(newRoot);
+    char **newModelKeys = NULL;
+    size_t newModelCount = 0;
+    if (newCount > 0)
+    {
+        newModelKeys = osAllocMem(sizeof(char *) * newCount);
+        if (newModelKeys == NULL)
+        {
+            cJSON_Delete(existingRoot);
+            osSnprintf(message, messageSize, "Out of memory");
+            return ERROR_OUT_OF_MEMORY;
+        }
+        osMemset(newModelKeys, 0, sizeof(char *) * newCount);
+    }
+
+    for (size_t i = 0; i < newCount; i++)
+    {
+        cJSON *entry = cJSON_GetArrayItem(newRoot, (int)i);
+        cJSON *model = cJSON_GetObjectItemCaseSensitive(entry, "model");
+        if (!cJSON_IsString(model) || model->valuestring == NULL || osStrlen(model->valuestring) == 0)
+        {
+            continue;
+        }
+        newModelKeys[newModelCount] = custom_asprintf("%s", model->valuestring);
+        if (newModelKeys[newModelCount] == NULL)
+        {
+            freeStringKeyArray(newModelKeys, newModelCount);
+            cJSON_Delete(existingRoot);
+            osSnprintf(message, messageSize, "Out of memory");
+            return ERROR_OUT_OF_MEMORY;
+        }
+        newModelCount++;
+    }
+
+    if (newModelCount > 1)
+    {
+        qsort(newModelKeys, newModelCount, sizeof(char *), compareStringKeysCaseInsensitive);
+    }
+
+    size_t existingCount = (size_t)cJSON_GetArraySize(existingRoot);
+    for (size_t i = 0; i < existingCount; i++)
+    {
+        cJSON *entry = cJSON_GetArrayItem(existingRoot, (int)i);
+        if (!cJSON_IsObject(entry))
+        {
+            continue;
+        }
+        cJSON *model = cJSON_GetObjectItemCaseSensitive(entry, "model");
+        if (!cJSON_IsString(model) || model->valuestring == NULL || osStrlen(model->valuestring) == 0)
+        {
+            continue;
+        }
+
+        if (!sortedStringArrayContainsCaseInsensitive(newModelKeys, newModelCount, model->valuestring))
+        {
+            freeStringKeyArray(newModelKeys, newModelCount);
+            osSnprintf(message, messageSize, "Removing model '%s' is blocked. Set allowRemoval=true to confirm removal", model->valuestring);
+            cJSON_Delete(existingRoot);
+            return ERROR_ACCESS_DENIED;
+        }
+    }
+
+    freeStringKeyArray(newModelKeys, newModelCount);
+    cJSON_Delete(existingRoot);
+    osSnprintf(message, messageSize, "OK");
+    return NO_ERROR;
+}
+
+static cJSON *jsonValueToStringNode(const cJSON *value)
+{
+    if (cJSON_IsString(value) && value->valuestring != NULL)
+    {
+        return cJSON_CreateString(value->valuestring);
+    }
+
+    if (cJSON_IsNumber(value))
+    {
+        char buffer[32];
+        osSnprintf(buffer, sizeof(buffer), "%.0f", value->valuedouble);
+        return cJSON_CreateString(buffer);
+    }
+
+    if (cJSON_IsBool(value))
+    {
+        return cJSON_CreateString(cJSON_IsTrue(value) ? "true" : "false");
+    }
+
+    return cJSON_CreateString("");
+}
+
+static error_t normalizeStringField(cJSON *entry, const char *fieldName)
+{
+    cJSON *field = cJSON_GetObjectItemCaseSensitive(entry, fieldName);
+    cJSON *normalized = jsonValueToStringNode(field);
+    if (normalized == NULL)
+    {
+        return ERROR_OUT_OF_MEMORY;
+    }
+
+    if (field != NULL)
+    {
+        if (!cJSON_ReplaceItemInObjectCaseSensitive(entry, fieldName, normalized))
+        {
+            cJSON_Delete(normalized);
+            return ERROR_FAILURE;
+        }
+    }
+    else
+    {
+        cJSON_AddItemToObject(entry, fieldName, normalized);
+    }
+
+    return NO_ERROR;
+}
+
+static error_t normalizeStringArrayField(cJSON *entry, const char *fieldName)
+{
+    cJSON *field = cJSON_GetObjectItemCaseSensitive(entry, fieldName);
+    if (!cJSON_IsArray(field))
+    {
+        cJSON *emptyArray = cJSON_CreateArray();
+        if (emptyArray == NULL)
+        {
+            return ERROR_OUT_OF_MEMORY;
+        }
+        if (field != NULL)
+        {
+            if (!cJSON_ReplaceItemInObjectCaseSensitive(entry, fieldName, emptyArray))
+            {
+                cJSON_Delete(emptyArray);
+                return ERROR_FAILURE;
+            }
+        }
+        else
+        {
+            cJSON_AddItemToObject(entry, fieldName, emptyArray);
+        }
+        return NO_ERROR;
+    }
+
+    size_t count = (size_t)cJSON_GetArraySize(field);
+    for (size_t i = 0; i < count; i++)
+    {
+        cJSON *value = cJSON_GetArrayItem(field, (int)i);
+        cJSON *normalized = jsonValueToStringNode(value);
+        if (normalized == NULL)
+        {
+            return ERROR_OUT_OF_MEMORY;
+        }
+        if (!cJSON_ReplaceItemInArray(field, (int)i, normalized))
+        {
+            cJSON_Delete(normalized);
+            return ERROR_FAILURE;
+        }
+    }
+
+    return NO_ERROR;
+}
+
+static error_t normalizeToniesCustomJsonForStorage(cJSON *root, char *message, size_t messageSize)
+{
+    // Persist a canonical shape (strings/arrays) so reads do not depend on client-side typing.
+    if (!cJSON_IsArray(root))
+    {
+        osSnprintf(message, messageSize, "Invalid payload: root must be a JSON array");
+        return ERROR_INVALID_SYNTAX;
+    }
+
+    size_t entryCount = (size_t)cJSON_GetArraySize(root);
+    for (size_t i = 0; i < entryCount; i++)
+    {
+        cJSON *entry = cJSON_GetArrayItem(root, (int)i);
+        if (!cJSON_IsObject(entry))
+        {
+            osSnprintf(message, messageSize, "Invalid entry at index %" PRIuSIZE ": expected object", i);
+            return ERROR_INVALID_SYNTAX;
+        }
+
+        const char *stringFields[] = {"no", "model", "title", "series", "episodes", "release", "language", "category", "pic"};
+        for (size_t fi = 0; fi < (sizeof(stringFields) / sizeof(stringFields[0])); fi++)
+        {
+            error_t normalizeFieldError = normalizeStringField(entry, stringFields[fi]);
+            if (normalizeFieldError != NO_ERROR)
+            {
+                osSnprintf(message, messageSize, "Failed to normalize field '%s' at index %" PRIuSIZE, stringFields[fi], i);
+                return normalizeFieldError;
+            }
+        }
+
+        error_t normalizeTracksError = normalizeStringArrayField(entry, "tracks");
+        if (normalizeTracksError != NO_ERROR)
+        {
+            osSnprintf(message, messageSize, "Failed to normalize field 'tracks' at index %" PRIuSIZE, i);
+            return normalizeTracksError;
+        }
+
+        cJSON *audioId = cJSON_GetObjectItemCaseSensitive(entry, "audio_id");
+        if (!cJSON_IsArray(audioId))
+        {
+            cJSON *emptyAudioId = cJSON_CreateArray();
+            if (emptyAudioId == NULL)
+            {
+                osSnprintf(message, messageSize, "Out of memory while normalizing payload");
+                return ERROR_OUT_OF_MEMORY;
+            }
+            if (audioId != NULL)
+            {
+                if (!cJSON_ReplaceItemInObjectCaseSensitive(entry, "audio_id", emptyAudioId))
+                {
+                    cJSON_Delete(emptyAudioId);
+                    osSnprintf(message, messageSize, "Failed to normalize payload");
+                    return ERROR_FAILURE;
+                }
+            }
+            else
+            {
+                cJSON_AddItemToObject(entry, "audio_id", emptyAudioId);
+            }
+            audioId = cJSON_GetObjectItemCaseSensitive(entry, "audio_id");
+        }
+
+        size_t audioCount = (size_t)cJSON_GetArraySize(audioId);
+        for (size_t j = 0; j < audioCount; j++)
+        {
+            cJSON *audioIdValue = cJSON_GetArrayItem(audioId, (int)j);
+            uint32_t parsedAudioId = 0;
+            if (!jsonGetUInt32Flexible(audioIdValue, &parsedAudioId))
+            {
+                osSnprintf(message, messageSize, "Invalid entry at index %" PRIuSIZE ": 'audio_id[%zu]' must be numeric", i, j);
                 return ERROR_INVALID_SYNTAX;
             }
 
-            cJSON *audioIdB = cJSON_GetObjectItemCaseSensitive(entryB, "audio_id");
-            cJSON *hashB = cJSON_GetObjectItemCaseSensitive(entryB, "hash");
-            size_t audioCountB = cJSON_IsArray(audioIdB) ? (size_t)cJSON_GetArraySize(audioIdB) : 0;
-
-            for (size_t ai = 0; ai < audioCountA; ai++)
+            char normalizedAudioId[16];
+            osSnprintf(normalizedAudioId, sizeof(normalizedAudioId), "%" PRIu32, parsedAudioId);
+            cJSON *normalizedValue = cJSON_CreateString(normalizedAudioId);
+            if (normalizedValue == NULL)
             {
-                cJSON *audioA = cJSON_GetArrayItem(audioIdA, (int)ai);
-                cJSON *hashVA = cJSON_GetArrayItem(hashA, (int)ai);
-                uint32_t aId = 0;
-                if (!jsonGetUInt32Flexible(audioA, &aId) || !cJSON_IsString(hashVA))
+                osSnprintf(message, messageSize, "Out of memory while normalizing payload");
+                return ERROR_OUT_OF_MEMORY;
+            }
+
+            if (!cJSON_ReplaceItemInArray(audioId, (int)j, normalizedValue))
+            {
+                cJSON_Delete(normalizedValue);
+                osSnprintf(message, messageSize, "Failed to normalize payload");
+                return ERROR_FAILURE;
+            }
+        }
+
+        cJSON *hash = cJSON_GetObjectItemCaseSensitive(entry, "hash");
+        if (!cJSON_IsArray(hash))
+        {
+            cJSON *emptyHash = cJSON_CreateArray();
+            if (emptyHash == NULL)
+            {
+                osSnprintf(message, messageSize, "Out of memory while normalizing payload");
+                return ERROR_OUT_OF_MEMORY;
+            }
+            if (hash != NULL)
+            {
+                if (!cJSON_ReplaceItemInObjectCaseSensitive(entry, "hash", emptyHash))
                 {
-                    continue;
+                    cJSON_Delete(emptyHash);
+                    osSnprintf(message, messageSize, "Failed to normalize payload");
+                    return ERROR_FAILURE;
                 }
+            }
+            else
+            {
+                cJSON_AddItemToObject(entry, "hash", emptyHash);
+            }
+            hash = cJSON_GetObjectItemCaseSensitive(entry, "hash");
+        }
 
-                for (size_t bi = 0; bi < audioCountB; bi++)
+        size_t hashCount = (size_t)cJSON_GetArraySize(hash);
+        for (size_t j = 0; j < hashCount; j++)
+        {
+            cJSON *hashValue = cJSON_GetArrayItem(hash, (int)j);
+            if (cJSON_IsString(hashValue) && hashValue->valuestring != NULL)
+            {
+                char normalizedHash[41];
+                for (size_t k = 0; k < 40; k++)
                 {
-                    cJSON *audioB = cJSON_GetArrayItem(audioIdB, (int)bi);
-                    cJSON *hashVB = cJSON_GetArrayItem(hashB, (int)bi);
-                    uint32_t bId = 0;
-                    if (!jsonGetUInt32Flexible(audioB, &bId) || !cJSON_IsString(hashVB))
-                    {
-                        continue;
-                    }
-
-                    if (aId == bId && osStrcasecmp(hashVA->valuestring, hashVB->valuestring) == 0)
-                    {
-                        osSnprintf(message, messageSize, "Duplicate audio_id+hash pair detected (audio_id=%" PRIu32 ")", aId);
-                        return ERROR_INVALID_SYNTAX;
-                    }
+                    normalizedHash[k] = (char)toupper((int)hashValue->valuestring[k]);
+                }
+                normalizedHash[40] = '\0';
+                cJSON *normalizedValue = cJSON_CreateString(normalizedHash);
+                if (normalizedValue == NULL)
+                {
+                    osSnprintf(message, messageSize, "Out of memory while normalizing payload");
+                    return ERROR_OUT_OF_MEMORY;
+                }
+                if (!cJSON_ReplaceItemInArray(hash, (int)j, normalizedValue))
+                {
+                    cJSON_Delete(normalizedValue);
+                    osSnprintf(message, messageSize, "Failed to normalize payload");
+                    return ERROR_FAILURE;
                 }
             }
         }
@@ -2659,6 +3240,10 @@ static int cmpStringAsc(const void *a, const void *b)
     return osStrcmp(s1, s2);
 }
 
+/**
+ * Remove old timestamped backup files while keeping the newest keepCount entries.
+ * Backups use <baseFileName>.<YYYYMMDD-HHMMSS>.bak, so lexicographic order is chronological.
+ */
 static void cleanupToniesCustomJsonBackups(const char *configDir, const char *baseFileName, size_t keepCount)
 {
     char *prefix = custom_asprintf("%s.", baseFileName);
@@ -2709,6 +3294,7 @@ static void cleanupToniesCustomJsonBackups(const char *configDir, const char *ba
 
     if (backupCount > keepCount)
     {
+        // Backup names contain sortable timestamps (YYYYMMDD-HHMMSS), so lexical sort is chronological.
         qsort(backupFiles, backupCount, sizeof(char *), cmpStringAsc);
         size_t toDelete = backupCount - keepCount;
         for (size_t i = 0; i < toDelete; i++)
@@ -2727,59 +3313,174 @@ static void cleanupToniesCustomJsonBackups(const char *configDir, const char *ba
     osFreeMem(prefix);
 }
 
-error_t handleApiToniesCustomJsonSet(HttpConnection *connection, const char_t *uri, const char_t *queryString, client_ctx_t *client_ctx)
+static error_t parseJsonRequestBody(HttpConnection *connection, cJSON **outJson, char *message, size_t messageSize)
 {
-    (void)uri;
-    (void)queryString;
+    if (outJson == NULL)
+    {
+        osSnprintf(message, messageSize, "Internal error");
+        return ERROR_INVALID_PARAMETER;
+    }
 
     if (connection->request.byteCount == 0 || connection->request.byteCount > (1024 * 1024))
     {
-        return writeApiStatusText(connection, 400, "Invalid body size");
+        osSnprintf(message, messageSize, "Invalid body size");
+        return ERROR_INVALID_LENGTH;
     }
 
     size_t bodySize = connection->request.byteCount;
     char *postData = osAllocMem(bodySize + 1);
     if (postData == NULL)
     {
-        return writeApiStatusText(connection, 500, "Out of memory");
+        osSnprintf(message, messageSize, "Out of memory");
+        return ERROR_OUT_OF_MEMORY;
     }
     osMemset(postData, 0, bodySize + 1);
 
-    size_t sizeRead = 0;
-    error_t recvError = httpReceive(connection, postData, bodySize, &sizeRead, 0x00);
-    if (recvError != NO_ERROR)
+    size_t totalRead = 0;
+    while (totalRead < bodySize)
     {
-        osFreeMem(postData);
-        return writeApiStatusText(connection, 400, "Could not read request body");
+        size_t chunkRead = 0;
+        error_t recvError = httpReadStream(connection, postData + totalRead, bodySize - totalRead, &chunkRead, 0x00);
+        if (recvError != NO_ERROR)
+        {
+            osFreeMem(postData);
+            osSnprintf(message, messageSize, "Could not read request body");
+            return recvError;
+        }
+        if (chunkRead == 0)
+        {
+            break;
+        }
+        totalRead += chunkRead;
     }
 
-    cJSON *inputJson = cJSON_ParseWithLengthOpts(postData, sizeRead, 0, 0);
-    if (inputJson == NULL)
+    if (totalRead != bodySize)
     {
         osFreeMem(postData);
-        return writeApiStatusText(connection, 400, "Invalid JSON payload");
+        osSnprintf(message, messageSize, "Could not read request body");
+        return ERROR_END_OF_STREAM;
     }
 
-    char validationMessage[256];
-    error_t validationError = validateToniesCustomJson(inputJson, validationMessage, sizeof(validationMessage));
+    cJSON *json = cJSON_ParseWithLengthOpts(postData, totalRead, 0, 0);
+    osFreeMem(postData);
+    if (json == NULL)
+    {
+        osSnprintf(message, messageSize, "Invalid JSON payload");
+        return ERROR_INVALID_SYNTAX;
+    }
+
+    *outJson = json;
+    osSnprintf(message, messageSize, "OK");
+    return NO_ERROR;
+}
+
+static error_t loadToniesCustomJsonRoot(const char *configDir, cJSON **outRoot)
+{
+    if (configDir == NULL || outRoot == NULL)
+    {
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    char *targetPath = custom_asprintf("%s%c%s", configDir, PATH_SEPARATOR, TONIES_CUSTOM_JSON_FILE);
+    if (targetPath == NULL)
+    {
+        return ERROR_OUT_OF_MEMORY;
+    }
+
+    if (!fsFileExists(targetPath))
+    {
+        osFreeMem(targetPath);
+        *outRoot = cJSON_CreateArray();
+        return (*outRoot != NULL) ? NO_ERROR : ERROR_OUT_OF_MEMORY;
+    }
+
+    size_t fileSize = 0;
+    if (fsGetFileSize(targetPath, (uint32_t *)&fileSize) != NO_ERROR)
+    {
+        osFreeMem(targetPath);
+        return ERROR_FAILURE;
+    }
+
+    char *rawJson = osAllocMem(fileSize + 1);
+    if (rawJson == NULL)
+    {
+        osFreeMem(targetPath);
+        return ERROR_OUT_OF_MEMORY;
+    }
+    osMemset(rawJson, 0, fileSize + 1);
+
+    FsFile *file = fsOpenFile(targetPath, FS_FILE_MODE_READ);
+    if (file == NULL)
+    {
+        osFreeMem(rawJson);
+        osFreeMem(targetPath);
+        return ERROR_FILE_OPENING_FAILED;
+    }
+
+    size_t pos = 0;
+    while (pos < fileSize)
+    {
+        size_t sizeRead = 0;
+        error_t readError = fsReadFile(file, &rawJson[pos], fileSize - pos, &sizeRead);
+        if (readError != NO_ERROR)
+        {
+            fsCloseFile(file);
+            osFreeMem(rawJson);
+            osFreeMem(targetPath);
+            return readError;
+        }
+        if (sizeRead == 0)
+        {
+            break;
+        }
+        pos += sizeRead;
+    }
+    fsCloseFile(file);
+    osFreeMem(targetPath);
+
+    cJSON *root = cJSON_ParseWithLengthOpts(rawJson, pos, 0, 0);
+    osFreeMem(rawJson);
+    if (!cJSON_IsArray(root))
+    {
+        cJSON_Delete(root);
+        return ERROR_INVALID_SYNTAX;
+    }
+
+    *outRoot = root;
+    return NO_ERROR;
+}
+
+static error_t saveToniesCustomJsonRoot(const char *configDir, cJSON *root, char *message, size_t messageSize)
+{
+    error_t validationError = validateToniesCustomJson(root, message, messageSize);
     if (validationError != NO_ERROR)
     {
-        cJSON_Delete(inputJson);
-        osFreeMem(postData);
-        return writeApiStatusText(connection, 400, validationMessage);
+        return validationError;
     }
 
-    char *jsonString = cJSON_PrintUnformatted(inputJson);
-    cJSON_Delete(inputJson);
-    osFreeMem(postData);
+    error_t normalizeError = normalizeToniesCustomJsonForStorage(root, message, messageSize);
+    if (normalizeError != NO_ERROR)
+    {
+        return normalizeError;
+    }
+
+    char *jsonString = cJSON_PrintUnformatted(root);
     if (jsonString == NULL)
     {
-        return writeApiStatusText(connection, 500, "Could not encode JSON");
+        osSnprintf(message, messageSize, "Could not encode JSON");
+        return ERROR_OUT_OF_MEMORY;
     }
 
-    const char *configDir = settings_get_string("internal.configdirfull");
     char *targetPath = custom_asprintf("%s%c%s", configDir, PATH_SEPARATOR, TONIES_CUSTOM_JSON_FILE);
     char *tmpPath = custom_asprintf("%s.tmp", targetPath);
+    if (targetPath == NULL || tmpPath == NULL)
+    {
+        osFreeMem(jsonString);
+        osFreeMem(targetPath);
+        osFreeMem(tmpPath);
+        osSnprintf(message, messageSize, "Out of memory");
+        return ERROR_OUT_OF_MEMORY;
+    }
 
     if (fsFileExists(targetPath))
     {
@@ -2796,8 +3497,11 @@ error_t handleApiToniesCustomJsonSet(HttpConnection *connection, const char_t *u
         }
 
         char *backupPath = custom_asprintf("%s%c%s.%s.bak", configDir, PATH_SEPARATOR, TONIES_CUSTOM_JSON_FILE, timestamp);
-        fsCopyFile(targetPath, backupPath, true);
-        osFreeMem(backupPath);
+        if (backupPath != NULL)
+        {
+            fsCopyFile(targetPath, backupPath, true);
+            osFreeMem(backupPath);
+        }
     }
 
     cleanupToniesCustomJsonBackups(configDir, TONIES_CUSTOM_JSON_FILE, 10);
@@ -2829,9 +3533,460 @@ error_t handleApiToniesCustomJsonSet(HttpConnection *connection, const char_t *u
 
     if (fileError != NO_ERROR)
     {
+        osSnprintf(message, messageSize, "Failed to save tonies.custom.json");
+        return fileError;
+    }
+
+    tonies_deinit();
+    tonies_init();
+    osSnprintf(message, messageSize, "OK");
+    return NO_ERROR;
+}
+
+static int findModelIndexInArray(cJSON *root, const char *model)
+{
+    if (!cJSON_IsArray(root) || model == NULL)
+    {
+        return -1;
+    }
+
+    size_t count = (size_t)cJSON_GetArraySize(root);
+    for (size_t i = 0; i < count; i++)
+    {
+        cJSON *entry = cJSON_GetArrayItem(root, (int)i);
+        cJSON *entryModel = cJSON_GetObjectItemCaseSensitive(entry, "model");
+        if (cJSON_IsString(entryModel) && entryModel->valuestring != NULL && osStrcasecmp(entryModel->valuestring, model) == 0)
+        {
+            return (int)i;
+        }
+    }
+
+    return -1;
+}
+
+static bool modelInDeleteList(cJSON *modelsArray, const char *model)
+{
+    if (!cJSON_IsArray(modelsArray) || model == NULL)
+    {
+        return false;
+    }
+
+    size_t count = (size_t)cJSON_GetArraySize(modelsArray);
+    for (size_t i = 0; i < count; i++)
+    {
+        cJSON *item = cJSON_GetArrayItem(modelsArray, (int)i);
+        if (cJSON_IsString(item) && item->valuestring != NULL && osStrcasecmp(item->valuestring, model) == 0)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+error_t handleApiToniesCustomJsonUpsert(HttpConnection *connection, const char_t *uri, const char_t *queryString, client_ctx_t *client_ctx)
+{
+    (void)uri;
+    (void)queryString;
+    (void)client_ctx;
+
+    char message[256];
+    cJSON *requestJson = NULL;
+    error_t bodyError = parseJsonRequestBody(connection, &requestJson, message, sizeof(message));
+    if (bodyError != NO_ERROR)
+    {
+        return writeApiStatusText(connection, 400, message);
+    }
+
+    cJSON *entries = requestJson;
+    cJSON *wrappedArray = NULL;
+    if (cJSON_IsObject(requestJson))
+    {
+        wrappedArray = cJSON_CreateArray();
+        if (wrappedArray == NULL)
+        {
+            cJSON_Delete(requestJson);
+            return writeApiStatusText(connection, 500, "Out of memory");
+        }
+        cJSON *dup = cJSON_Duplicate(requestJson, 1);
+        if (dup == NULL)
+        {
+            cJSON_Delete(wrappedArray);
+            cJSON_Delete(requestJson);
+            return writeApiStatusText(connection, 500, "Out of memory");
+        }
+        cJSON_AddItemToArray(wrappedArray, dup);
+        entries = wrappedArray;
+    }
+    else if (!cJSON_IsArray(requestJson))
+    {
+        cJSON_Delete(requestJson);
+        return writeApiStatusText(connection, 400, "Invalid payload: expected object or array");
+    }
+
+    const char *configDir = settings_get_string("internal.configdirfull");
+    cJSON *root = NULL;
+    error_t loadError = loadToniesCustomJsonRoot(configDir, &root);
+    if (loadError != NO_ERROR)
+    {
+        cJSON_Delete(wrappedArray);
+        cJSON_Delete(requestJson);
+        return writeApiStatusText(connection, 500, "Failed to load tonies.custom.json");
+    }
+
+    size_t count = (size_t)cJSON_GetArraySize(entries);
+    for (size_t i = 0; i < count; i++)
+    {
+        cJSON *entry = cJSON_GetArrayItem(entries, (int)i);
+        if (!cJSON_IsObject(entry))
+        {
+            cJSON_Delete(root);
+            cJSON_Delete(wrappedArray);
+            cJSON_Delete(requestJson);
+            return writeApiStatusText(connection, 400, "Invalid payload: each entry must be object");
+        }
+
+        cJSON *model = cJSON_GetObjectItemCaseSensitive(entry, "model");
+        if (!jsonIsNonEmptyString(model))
+        {
+            cJSON_Delete(root);
+            cJSON_Delete(wrappedArray);
+            cJSON_Delete(requestJson);
+            return writeApiStatusText(connection, 400, "Invalid payload: 'model' is required");
+        }
+
+        cJSON *entryCopy = cJSON_Duplicate(entry, 1);
+        if (entryCopy == NULL)
+        {
+            cJSON_Delete(root);
+            cJSON_Delete(wrappedArray);
+            cJSON_Delete(requestJson);
+            return writeApiStatusText(connection, 500, "Out of memory");
+        }
+
+        int existingIndex = findModelIndexInArray(root, model->valuestring);
+        if (existingIndex >= 0)
+        {
+            if (!cJSON_ReplaceItemInArray(root, existingIndex, entryCopy))
+            {
+                cJSON_Delete(entryCopy);
+                cJSON_Delete(root);
+                cJSON_Delete(wrappedArray);
+                cJSON_Delete(requestJson);
+                return writeApiStatusText(connection, 500, "Failed to update entry");
+            }
+        }
+        else
+        {
+            cJSON_AddItemToArray(root, entryCopy);
+        }
+    }
+
+    error_t saveError = saveToniesCustomJsonRoot(configDir, root, message, sizeof(message));
+    cJSON_Delete(root);
+    cJSON_Delete(wrappedArray);
+    cJSON_Delete(requestJson);
+    if (saveError != NO_ERROR)
+    {
+        return writeApiStatusText(connection, (saveError == ERROR_OUT_OF_MEMORY) ? 500 : 400, message);
+    }
+
+    return writeApiStatusText(connection, 200, "OK");
+}
+
+error_t handleApiToniesCustomJsonDelete(HttpConnection *connection, const char_t *uri, const char_t *queryString, client_ctx_t *client_ctx)
+{
+    (void)uri;
+    (void)queryString;
+    (void)client_ctx;
+
+    char message[256];
+    cJSON *requestJson = NULL;
+    error_t bodyError = parseJsonRequestBody(connection, &requestJson, message, sizeof(message));
+    if (bodyError != NO_ERROR)
+    {
+        return writeApiStatusText(connection, 400, message);
+    }
+
+    cJSON *models = NULL;
+    if (cJSON_IsArray(requestJson))
+    {
+        models = requestJson;
+    }
+    else if (cJSON_IsObject(requestJson))
+    {
+        models = cJSON_GetObjectItemCaseSensitive(requestJson, "models");
+    }
+
+    if (!cJSON_IsArray(models) || cJSON_GetArraySize(models) <= 0)
+    {
+        cJSON_Delete(requestJson);
+        return writeApiStatusText(connection, 400, "Invalid payload: 'models' array is required");
+    }
+
+    const char *configDir = settings_get_string("internal.configdirfull");
+    cJSON *root = NULL;
+    error_t loadError = loadToniesCustomJsonRoot(configDir, &root);
+    if (loadError != NO_ERROR)
+    {
+        cJSON_Delete(requestJson);
+        return writeApiStatusText(connection, 500, "Failed to load tonies.custom.json");
+    }
+
+    for (int i = cJSON_GetArraySize(root) - 1; i >= 0; i--)
+    {
+        cJSON *entry = cJSON_GetArrayItem(root, i);
+        cJSON *model = cJSON_GetObjectItemCaseSensitive(entry, "model");
+        if (cJSON_IsString(model) && model->valuestring != NULL && modelInDeleteList(models, model->valuestring))
+        {
+            cJSON_DeleteItemFromArray(root, i);
+        }
+    }
+
+    error_t saveError = saveToniesCustomJsonRoot(configDir, root, message, sizeof(message));
+    cJSON_Delete(root);
+    cJSON_Delete(requestJson);
+    if (saveError != NO_ERROR)
+    {
+        return writeApiStatusText(connection, (saveError == ERROR_OUT_OF_MEMORY) ? 500 : 400, message);
+    }
+
+    return writeApiStatusText(connection, 200, "OK");
+}
+
+error_t handleApiToniesCustomJsonRename(HttpConnection *connection, const char_t *uri, const char_t *queryString, client_ctx_t *client_ctx)
+{
+    (void)uri;
+    (void)queryString;
+    (void)client_ctx;
+
+    char message[256];
+    cJSON *requestJson = NULL;
+    error_t bodyError = parseJsonRequestBody(connection, &requestJson, message, sizeof(message));
+    if (bodyError != NO_ERROR)
+    {
+        return writeApiStatusText(connection, 400, message);
+    }
+
+    if (!cJSON_IsObject(requestJson))
+    {
+        cJSON_Delete(requestJson);
+        return writeApiStatusText(connection, 400, "Invalid payload: expected object");
+    }
+
+    cJSON *fromModel = cJSON_GetObjectItemCaseSensitive(requestJson, "fromModel");
+    cJSON *toModel = cJSON_GetObjectItemCaseSensitive(requestJson, "toModel");
+    if (!jsonIsNonEmptyString(fromModel) || !jsonIsNonEmptyString(toModel))
+    {
+        cJSON_Delete(requestJson);
+        return writeApiStatusText(connection, 400, "Invalid payload: 'fromModel' and 'toModel' are required");
+    }
+    if (osStrcasecmp(fromModel->valuestring, toModel->valuestring) == 0)
+    {
+        cJSON_Delete(requestJson);
+        return writeApiStatusText(connection, 200, "OK");
+    }
+
+    const char *configDir = settings_get_string("internal.configdirfull");
+    cJSON *root = NULL;
+    error_t loadError = loadToniesCustomJsonRoot(configDir, &root);
+    if (loadError != NO_ERROR)
+    {
+        cJSON_Delete(requestJson);
+        return writeApiStatusText(connection, 500, "Failed to load tonies.custom.json");
+    }
+
+    int fromIndex = findModelIndexInArray(root, fromModel->valuestring);
+    if (fromIndex < 0)
+    {
+        cJSON_Delete(root);
+        cJSON_Delete(requestJson);
+        return writeApiStatusText(connection, 404, "Source model not found");
+    }
+    if (findModelIndexInArray(root, toModel->valuestring) >= 0)
+    {
+        cJSON_Delete(root);
+        cJSON_Delete(requestJson);
+        return writeApiStatusText(connection, 400, "Target model already exists");
+    }
+
+    cJSON *entry = cJSON_GetArrayItem(root, fromIndex);
+    cJSON *newModel = cJSON_CreateString(toModel->valuestring);
+    if (newModel == NULL)
+    {
+        cJSON_Delete(root);
+        cJSON_Delete(requestJson);
+        return writeApiStatusText(connection, 500, "Out of memory");
+    }
+    if (!cJSON_ReplaceItemInObjectCaseSensitive(entry, "model", newModel))
+    {
+        cJSON_Delete(newModel);
+        cJSON_Delete(root);
+        cJSON_Delete(requestJson);
+        return writeApiStatusText(connection, 500, "Failed to rename model");
+    }
+
+    error_t saveError = saveToniesCustomJsonRoot(configDir, root, message, sizeof(message));
+    cJSON_Delete(root);
+    cJSON_Delete(requestJson);
+    if (saveError != NO_ERROR)
+    {
+        return writeApiStatusText(connection, (saveError == ERROR_OUT_OF_MEMORY) ? 500 : 400, message);
+    }
+
+    return writeApiStatusText(connection, 200, "OK");
+}
+
+error_t handleApiToniesCustomJsonSet(HttpConnection *connection, const char_t *uri, const char_t *queryString, client_ctx_t *client_ctx)
+{
+    (void)uri;
+    (void)queryString;
+
+    if (connection->request.byteCount == 0 || connection->request.byteCount > (1024 * 1024))
+    {
+        return writeApiStatusText(connection, 400, "Invalid body size");
+    }
+
+    size_t bodySize = connection->request.byteCount;
+    char *postData = osAllocMem(bodySize + 1);
+    if (postData == NULL)
+    {
+        return writeApiStatusText(connection, 500, "Out of memory");
+    }
+    osMemset(postData, 0, bodySize + 1);
+
+    size_t totalRead = 0;
+    while (totalRead < bodySize)
+    {
+        size_t chunkRead = 0;
+        error_t recvError = httpReadStream(connection, postData + totalRead, bodySize - totalRead, &chunkRead, 0x00);
+        if (recvError != NO_ERROR)
+        {
+            osFreeMem(postData);
+            return writeApiStatusText(connection, 400, "Could not read request body");
+        }
+        if (chunkRead == 0)
+        {
+            break;
+        }
+        totalRead += chunkRead;
+    }
+
+    if (totalRead != bodySize)
+    {
+        osFreeMem(postData);
+        return writeApiStatusText(connection, 400, "Could not read request body");
+    }
+
+    cJSON *inputJson = cJSON_ParseWithLengthOpts(postData, totalRead, 0, 0);
+    if (inputJson == NULL)
+    {
+        osFreeMem(postData);
+        return writeApiStatusText(connection, 400, "Invalid JSON payload");
+    }
+
+    bool allowRemoval = false;
+    char allowRemovalStr[16];
+    allowRemovalStr[0] = '\0';
+    if (queryGet(queryString, "allowRemoval", allowRemovalStr, sizeof(allowRemovalStr)))
+    {
+        allowRemoval = isTrueFlagValue(allowRemovalStr);
+    }
+
+    char validationMessage[256];
+    error_t validationError = validateToniesCustomJson(inputJson, validationMessage, sizeof(validationMessage));
+    if (validationError != NO_ERROR)
+    {
+        cJSON_Delete(inputJson);
+        osFreeMem(postData);
+        return writeApiStatusText(connection, 400, validationMessage);
+    }
+
+    const char *configDir = settings_get_string("internal.configdirfull");
+    error_t removalGuardError = ensureNoExistingModelRemovedWithoutFlag(inputJson, configDir, allowRemoval, validationMessage, sizeof(validationMessage));
+    if (removalGuardError != NO_ERROR)
+    {
+        cJSON_Delete(inputJson);
+        osFreeMem(postData);
+        return writeApiStatusText(connection, 400, validationMessage);
+    }
+
+    error_t normalizeError = normalizeToniesCustomJsonForStorage(inputJson, validationMessage, sizeof(validationMessage));
+    if (normalizeError != NO_ERROR)
+    {
+        cJSON_Delete(inputJson);
+        osFreeMem(postData);
+        if (normalizeError == ERROR_OUT_OF_MEMORY)
+        {
+            return writeApiStatusText(connection, 500, "Out of memory");
+        }
+        return writeApiStatusText(connection, 400, validationMessage);
+    }
+
+    char *jsonString = cJSON_PrintUnformatted(inputJson);
+    cJSON_Delete(inputJson);
+    osFreeMem(postData);
+    if (jsonString == NULL)
+    {
+        return writeApiStatusText(connection, 500, "Could not encode JSON");
+    }
+
+    char *targetPath = custom_asprintf("%s%c%s", configDir, PATH_SEPARATOR, TONIES_CUSTOM_JSON_FILE);
+    char *tmpPath = custom_asprintf("%s.tmp", targetPath);
+
+    if (fsFileExists(targetPath))
+    {
+        time_t now = time(NULL);
+        struct tm *timeInfo = localtime(&now);
+        char timestamp[32];
+        if (timeInfo != NULL)
+        {
+            strftime(timestamp, sizeof(timestamp), "%Y%m%d-%H%M%S", timeInfo);
+        }
+        else
+        {
+            osSnprintf(timestamp, sizeof(timestamp), "unknown");
+        }
+
+        char *backupPath = custom_asprintf("%s%c%s.%s.bak", configDir, PATH_SEPARATOR, TONIES_CUSTOM_JSON_FILE, timestamp);
+        fsCopyFile(targetPath, backupPath, true);
+        osFreeMem(backupPath);
+    }
+
+    cleanupToniesCustomJsonBackups(configDir, TONIES_CUSTOM_JSON_FILE, 10);
+
+    error_t fileError = NO_ERROR;
+    // Write to a temp file and then move it into place to avoid partially written target files.
+    FsFile *file = fsOpenFile(tmpPath, FS_FILE_MODE_WRITE | FS_FILE_MODE_TRUNC);
+    if (file == NULL)
+    {
+        fileError = ERROR_FILE_OPENING_FAILED;
+    }
+    else
+    {
+        fileError = fsWriteFile(file, jsonString, osStrlen(jsonString));
+        fsCloseFile(file);
+    }
+
+    if (fileError == NO_ERROR)
+    {
+        fileError = fsMoveFile(tmpPath, targetPath, true);
+    }
+    else
+    {
+        fsDeleteFile(tmpPath);
+    }
+
+    osFreeMem(jsonString);
+    osFreeMem(tmpPath);
+    osFreeMem(targetPath);
+
+    if (fileError != NO_ERROR)
+    {
         return writeApiStatusText(connection, 500, "Failed to save tonies.custom.json");
     }
 
+    // Reload in-memory catalog so subsequent API reads use the just-written file.
     tonies_deinit();
     tonies_init();
 
