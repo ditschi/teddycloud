@@ -3247,6 +3247,10 @@ static int cmpStringAsc(const void *a, const void *b)
 static void cleanupToniesCustomJsonBackups(const char *configDir, const char *baseFileName, size_t keepCount)
 {
     char *prefix = custom_asprintf("%s.", baseFileName);
+    if (prefix == NULL)
+    {
+        return;
+    }
     size_t prefixLen = osStrlen(prefix);
     char *suffix = ".bak";
     size_t suffixLen = osStrlen(suffix);
@@ -3282,13 +3286,22 @@ static void cleanupToniesCustomJsonBackups(const char *configDir, const char *ba
         }
 
         char **resized = osAllocMem((backupCount + 1) * sizeof(char *));
+        if (resized == NULL)
+        {
+            break;
+        }
         if (backupFiles != NULL)
         {
             osMemcpy(resized, backupFiles, backupCount * sizeof(char *));
             osFreeMem(backupFiles);
         }
         backupFiles = resized;
-        backupFiles[backupCount++] = strdup(entry.name);
+        backupFiles[backupCount] = strdup(entry.name);
+        if (backupFiles[backupCount] == NULL)
+        {
+            break;
+        }
+        backupCount++;
     }
     fsCloseDir(dir);
 
@@ -3300,8 +3313,11 @@ static void cleanupToniesCustomJsonBackups(const char *configDir, const char *ba
         for (size_t i = 0; i < toDelete; i++)
         {
             char *fullPath = custom_asprintf("%s%c%s", configDir, PATH_SEPARATOR, backupFiles[i]);
-            fsDeleteFile(fullPath);
-            osFreeMem(fullPath);
+            if (fullPath != NULL)
+            {
+                fsDeleteFile(fullPath);
+                osFreeMem(fullPath);
+            }
         }
     }
 
@@ -3709,17 +3725,30 @@ error_t handleApiToniesCustomJsonDelete(HttpConnection *connection, const char_t
     }
 
     cJSON *models = NULL;
+    cJSON *modelsCopy = NULL;
     if (cJSON_IsArray(requestJson))
     {
         models = requestJson;
     }
     else if (cJSON_IsObject(requestJson))
     {
-        models = cJSON_GetObjectItemCaseSensitive(requestJson, "models");
+        cJSON *requestModels = cJSON_GetObjectItemCaseSensitive(requestJson, "models");
+        if (cJSON_IsArray(requestModels))
+        {
+            // Keep a detached copy so models lifetime is independent from requestJson.
+            modelsCopy = cJSON_Duplicate(requestModels, 1);
+            if (modelsCopy == NULL)
+            {
+                cJSON_Delete(requestJson);
+                return writeApiStatusText(connection, 500, "Out of memory");
+            }
+            models = modelsCopy;
+        }
     }
 
     if (!cJSON_IsArray(models) || cJSON_GetArraySize(models) <= 0)
     {
+        cJSON_Delete(modelsCopy);
         cJSON_Delete(requestJson);
         return writeApiStatusText(connection, 400, "Invalid payload: 'models' array is required");
     }
@@ -3729,6 +3758,7 @@ error_t handleApiToniesCustomJsonDelete(HttpConnection *connection, const char_t
     error_t loadError = loadToniesCustomJsonRoot(configDir, &root);
     if (loadError != NO_ERROR)
     {
+        cJSON_Delete(modelsCopy);
         cJSON_Delete(requestJson);
         return writeApiStatusText(connection, 500, "Failed to load tonies.custom.json");
     }
@@ -3745,6 +3775,7 @@ error_t handleApiToniesCustomJsonDelete(HttpConnection *connection, const char_t
 
     error_t saveError = saveToniesCustomJsonRoot(configDir, root, message, sizeof(message));
     cJSON_Delete(root);
+    cJSON_Delete(modelsCopy);
     cJSON_Delete(requestJson);
     if (saveError != NO_ERROR)
     {
@@ -3840,7 +3871,6 @@ error_t handleApiToniesCustomJsonRename(HttpConnection *connection, const char_t
 error_t handleApiToniesCustomJsonSet(HttpConnection *connection, const char_t *uri, const char_t *queryString, client_ctx_t *client_ctx)
 {
     (void)uri;
-    (void)queryString;
 
     if (connection->request.byteCount == 0 || connection->request.byteCount > (1024 * 1024))
     {
@@ -3932,7 +3962,18 @@ error_t handleApiToniesCustomJsonSet(HttpConnection *connection, const char_t *u
     }
 
     char *targetPath = custom_asprintf("%s%c%s", configDir, PATH_SEPARATOR, TONIES_CUSTOM_JSON_FILE);
+    if (targetPath == NULL)
+    {
+        osFreeMem(jsonString);
+        return writeApiStatusText(connection, 500, "Out of memory");
+    }
     char *tmpPath = custom_asprintf("%s.tmp", targetPath);
+    if (tmpPath == NULL)
+    {
+        osFreeMem(jsonString);
+        osFreeMem(targetPath);
+        return writeApiStatusText(connection, 500, "Out of memory");
+    }
 
     if (fsFileExists(targetPath))
     {
@@ -3949,8 +3990,11 @@ error_t handleApiToniesCustomJsonSet(HttpConnection *connection, const char_t *u
         }
 
         char *backupPath = custom_asprintf("%s%c%s.%s.bak", configDir, PATH_SEPARATOR, TONIES_CUSTOM_JSON_FILE, timestamp);
-        fsCopyFile(targetPath, backupPath, true);
-        osFreeMem(backupPath);
+        if (backupPath != NULL)
+        {
+            fsCopyFile(targetPath, backupPath, true);
+            osFreeMem(backupPath);
+        }
     }
 
     cleanupToniesCustomJsonBackups(configDir, TONIES_CUSTOM_JSON_FILE, 10);
